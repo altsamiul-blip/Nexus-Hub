@@ -1,0 +1,15 @@
+{
+  "name": "nexus-hub",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Proxy link hub with signup, viewer login and approval-gated admin login",
+  "main": "server.js",
+  "engines": { "node": ">=22.5.0" },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server.js",
+    "admin": "node --disable-warning=ExperimentalWarning admin-cli.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3"
+  }
+}
