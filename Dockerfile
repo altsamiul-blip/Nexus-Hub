@@ -1,39 +1,35 @@
 # syntax = docker/dockerfile:1
+# NEXUS HUB runtime image.
+# Node 22 LTS (jod) on Alpine: current, supported release with a small musl-based
+# userland, so the stale Debian glibc/zlib/gnutls packages from the previous
+# node:22.5.0-slim base are gone entirely.
+FROM node:22.23.4-alpine
 
-# Adjust NODE_VERSION as desired
-ARG NODE_VERSION=22.5.0
-FROM node:${NODE_VERSION}-slim AS base
+# Apply the distro's current fixed packages for this image tag.
+RUN apk upgrade --no-cache
 
-LABEL fly_launch_runtime="Node.js"
+ENV NODE_ENV=production \
+    PORT=3000 \
+    HOST=0.0.0.0 \
+    DB_PATH=/data/nexus.db
 
-# Node.js app lives here
 WORKDIR /app
 
-# Set production environment
-ENV NODE_ENV="production"
-
-
-# Throw-away build stage to reduce size of final image
-FROM base AS build
-
-# Install packages needed to build node modules
-RUN apt-get update -qq && \
-    apt-get install --no-install-recommends -y build-essential node-gyp pkg-config python-is-python3
-
-# Install node modules
+# No third-party runtime dependencies: the app uses only Node built-ins
+# (node:http, node:sqlite, node:crypto), so there is no npm install step.
 COPY package.json ./
-RUN npm install
+COPY db.js auth.js server.js ./
+COPY public ./public
+COPY test ./test
 
-# Copy application code
-COPY . .
+# Persistent data directory. The platform disk is mounted at /data; the app
+# falls back to a temp database if that path is unavailable, and logs which
+# file it opened.
+RUN mkdir -p /data && chmod 0777 /data
 
-
-# Final stage for app image
-FROM base
-
-# Copy built application
-COPY --from=build /app /app
-
-# Start the server by default, this can be overwritten at runtime
 EXPOSE 3000
-CMD [ "npm", "run", "start" ]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+CMD ["node", "--disable-warning=ExperimentalWarning", "server.js"]
