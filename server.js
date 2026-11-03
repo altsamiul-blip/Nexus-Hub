@@ -1,532 +1,741 @@
 'use strict';
-require('./env');
+
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
-const crypto = require('node:crypto');
-const bcrypt = require('bcryptjs');
-const { db, tx } = require('./db');
 
-/* ============ config ============ */
+const { getDb, getDbPath, CATEGORIES } = require('./db');
+const {
+  hashPassword,
+  verifyPassword,
+  createSession,
+  destroySession,
+  purgeExpiredSessions,
+  userForToken,
+} = require('./auth');
+
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || (process.env.PORT ? '0.0.0.0' : '127.0.0.1');
-const FREE_LOGINS = 2;                                   // first N admin logins per account are automatic
-const BCRYPT_COST = 12;
-// How long the owner has to answer a login request (decimals allowed, e.g. 0.05 for tests). Default 24h.
-const APPROVAL_TTL_MS = (Number(process.env.APPROVAL_TTL_MINUTES) || 1440) * 60 * 1000;
-const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const MAX_PENDING_PER_ACCOUNT = 3;
-const OWNER_SETUP_CODE = process.env.OWNER_SETUP_CODE || '';
-const NOTIFY_URL = process.env.NOTIFY_URL || '';          // optional push (e.g. https://ntfy.sh/your-secret-topic)
-const TRUST_PROXY = !!process.env.TRUST_PROXY;
-const COOKIE = 'nh_session';
-const STATUSES = ['Working', 'Testing', 'Down'];
+const COOKIE_NAME = 'nexus_session';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
-/* ============ small helpers ============ */
-class HttpError extends Error {
-  constructor(status, message, extra) { super(message); this.status = status; this.extra = extra || {}; }
+const db = getDb();
+
+/* ------------------------------------------------------------------ *
+ * Helpers
+ * ------------------------------------------------------------------ */
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.png': 'image/png',
+  '.webmanifest': 'application/manifest+json',
+};
+
+function sendJson(res, status, payload, extraHeaders = {}) {
+  const body = JSON.stringify(payload);
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    ...extraHeaders,
+  });
+  res.end(body);
 }
-const now = () => Date.now();
-const sha256 = s => crypto.createHash('sha256').update(String(s)).digest('hex');
-const newToken = () => crypto.randomBytes(32).toString('base64url');
-function safeEqual(a, b) {
-  const x = Buffer.from(String(a)), y = Buffer.from(String(b));
-  return x.length === y.length && crypto.timingSafeEqual(x, y);
+
+function sendError(res, status, message) {
+  sendJson(res, status, { error: message });
 }
+
 function parseCookies(req) {
-  const out = {};
-  for (const part of String(req.headers.cookie || '').split(';')) {
-    const i = part.indexOf('=');
-    if (i < 1) continue;
-    try { out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim()); } catch (e) { /* ignore */ }
+  const header = req.headers.cookie;
+  const out = Object.create(null);
+  if (!header) return out;
+  for (const part of header.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx === -1) continue;
+    const key = part.slice(0, idx).trim();
+    const value = part.slice(idx + 1).trim();
+    if (key) out[key] = decodeURIComponent(value);
   }
   return out;
 }
-function send(res, status, obj) {
-  const body = JSON.stringify(obj);
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Length': Buffer.byteLength(body) });
-  res.end(body);
-}
-const publicUser = u => ({ id: u.id, username: u.username, role: u.role, isOwner: !!u.is_owner });
 
-/* ============ validation ============ */
-function validUsername(u) { return typeof u === 'string' && /^[A-Za-z0-9_.-]{3,32}$/.test(u); }
-function validPassword(p) { return typeof p === 'string' && p.length >= 8 && Buffer.byteLength(p) <= 72; } // bcrypt reads 72 bytes
-function normalizeUrl(s) {
-  if (!s) return null;
-  s = String(s).trim().replace(/^[<("'`\[]+|[>)"'`\].,;:!?]+$/g, '');
-  if (!s || /\s/.test(s)) return null;
-  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) s = 'https://' + s;
-  try {
-    const u = new URL(s);
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
-    if (!u.hostname.includes('.') && u.hostname !== 'localhost') return null;
-    return u.href;
-  } catch (e) { return null; }
-}
-function cleanLogo(s) {
-  s = String(s || '').trim();
-  if (!s) return '';
-  if (/^data:image\/(png|jpe?g|webp|gif);base64,[A-Za-z0-9+/=]+$/i.test(s)) return s.length < 400000 ? s : '';
-  return normalizeUrl(s) || '';
-}
-function hostTitle(url) {
-  const host = new URL(url).hostname.replace(/^www\./, '');
-  const parts = host.split('.');
-  const label = parts.length > 2 ? parts[parts.length - 2] : parts[0];
-  return label.charAt(0).toUpperCase() + label.slice(1);
-}
-function sanitizeLink(b) {
-  b = b || {};
-  const url = normalizeUrl(b.url);
-  if (!url) return null;
-  return {
-    url,
-    title: String(b.title || '').trim().slice(0, 200) || hostTitle(url),
-    category: String(b.category || '').trim().slice(0, 60),
-    status: STATUSES.includes(b.status) ? b.status : 'Testing',
-    logo: cleanLogo(b.logo)
-  };
-}
-const isUnique = e => /UNIQUE constraint failed/i.test(String(e && e.message));
-
-/* ============ rate limiting (in memory; resets on restart) ============ */
-const failures = new Map();
-const signups = new Map();
-function recent(map, key, windowMs) {
-  const arr = (map.get(key) || []).filter(t => t > now() - windowMs);
-  map.set(key, arr);
-  return arr;
-}
-function checkLoginLimit(key) {
-  if (recent(failures, key, 15 * 60 * 1000).length >= 8) throw new HttpError(429, 'Too many failed attempts. Try again in a few minutes.');
-}
-function recordFailure(key) { recent(failures, key, 15 * 60 * 1000).push(now()); }
-function checkSignupLimit(ip) {
-  const arr = recent(signups, ip, 60 * 60 * 1000);
-  if (arr.length >= 10) throw new HttpError(429, 'Too many sign-ups from this address. Try again later.');
-  arr.push(now());
+function isHttps(req) {
+  const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  return proto === 'https';
 }
 
-/* ============ sessions ============ */
-function startSession(ctx, userId) {
-  const token = newToken();
-  db.prepare('INSERT INTO sessions(token_hash, user_id, expires_at) VALUES (?, ?, ?)').run(sha256(token), userId, now() + SESSION_TTL_MS);
-  ctx.res.setHeader('Set-Cookie', `${COOKIE}=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_TTL_MS / 1000}${ctx.secure ? '; Secure' : ''}`);
-}
-function loadSession(ctx) {
-  const token = parseCookies(ctx.req)[COOKIE];
-  if (!token) return;
-  const hash = sha256(token);
-  const u = db.prepare(`SELECT u.id, u.username, u.role, u.is_owner, u.status
-                        FROM sessions s JOIN users u ON u.id = s.user_id
-                        WHERE s.token_hash = ? AND s.expires_at > ? AND u.status = 'active'`).get(hash, now());
-  if (u) { ctx.user = u; ctx.sessionHash = hash; }
+function sessionCookie(value, req, maxAgeSeconds) {
+  const bits = [
+    `${COOKIE_NAME}=${encodeURIComponent(value)}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    `Max-Age=${maxAgeSeconds}`,
+  ];
+  if (isHttps(req)) bits.push('Secure');
+  return bits.join('; ');
 }
 
-/* ============ owner notifications (SSE + optional push) ============ */
-const adminStreams = new Set();                   // { res, isOwner } for every open admin page
-function broadcast(event, data, ownerOnly) {
-  for (const s of adminStreams) {
-    if (ownerOnly && !s.isOwner) continue;
-    try { s.res.write(`event: ${event}\ndata: ${JSON.stringify(data || {})}\n\n`); } catch (e) { adminStreams.delete(s); }
-  }
-}
-function pushNotify(text) {
-  if (!NOTIFY_URL || typeof fetch !== 'function') return;
-  fetch(NOTIFY_URL, { method: 'POST', body: text, headers: { Title: 'Nexus Hub', 'Content-Type': 'text/plain; charset=utf-8' } }).catch(() => {});
-}
-setInterval(() => broadcast('ping', {}), 20000).unref();
-
-/* ============ expiry sweep ============ */
-function expireStale() {
-  const r = db.prepare("UPDATE login_attempts SET status = 'expired', decided_at = ? WHERE status IN ('pending','approved') AND expires_at <= ?").run(now(), now());
-  if (r.changes > 0) broadcast('refresh', {}, true);
-  return r.changes;
-}
-setInterval(() => {
-  expireStale();
-  db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(now());
-  db.prepare("DELETE FROM login_attempts WHERE status != 'pending' AND created_at < ?").run(now() - 7 * 24 * 3600 * 1000);
-  for (const m of [failures, signups]) for (const k of m.keys()) if (!recent(m, k, 60 * 60 * 1000).length) m.delete(k);
-}, 30000).unref();
-
-/* ============ routing ============ */
-const routes = [];
-function route(method, pattern, auth, handler) {
-  const keys = [];
-  const re = new RegExp('^' + pattern.replace(/:([a-z]+)/gi, (_, k) => { keys.push(k); return '([^/]+)'; }) + '/?$');
-  routes.push({ method, re, keys, auth, handler });
-}
-
-function readJson(req, limit) {
+function readJson(req, limit = 64 * 1024) {
   return new Promise((resolve, reject) => {
-    const chunks = []; let size = 0;
-    req.on('data', c => {
-      size += c.length;
-      if (size > limit) { reject(new HttpError(413, 'Request too large.')); req.destroy(); return; }
-      chunks.push(c);
+    let size = 0;
+    const chunks = [];
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > limit) {
+        reject(Object.assign(new Error('Request body too large'), { status: 413 }));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
     });
     req.on('end', () => {
-      if (!size) return resolve({});
-      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch (e) { reject(new HttpError(400, 'Invalid JSON.')); }
+      if (!chunks.length) return resolve({});
+      try {
+        const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          return reject(Object.assign(new Error('Invalid JSON body'), { status: 400 }));
+        }
+        resolve(parsed);
+      } catch {
+        reject(Object.assign(new Error('Invalid JSON body'), { status: 400 }));
+      }
     });
     req.on('error', reject);
   });
 }
 
-async function handleApi(req, res, url) {
-  const ctx = {
-    req, res, url, params: {}, body: {}, user: null,
-    ip: (TRUST_PROXY && String(req.headers['x-forwarded-for'] || '').split(',')[0].trim()) || req.socket.remoteAddress || '',
-    secure: !!req.socket.encrypted || (TRUST_PROXY && req.headers['x-forwarded-proto'] === 'https')
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[a-z]{2,}$/i;
+
+function normalizeEmail(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function str(value, max) {
+  return String(value == null ? '' : value).trim().slice(0, max);
+}
+
+function validateEmail(email) {
+  if (!email || email.length > 254 || !EMAIL_RE.test(email)) {
+    return 'Enter a valid email address.';
+  }
+  return null;
+}
+
+function validatePassword(password) {
+  if (typeof password !== 'string' || password.length < 8) {
+    return 'Password must be at least 8 characters.';
+  }
+  if (password.length > 200) return 'Password is too long.';
+  return null;
+}
+
+function validateName(name) {
+  if (!name || name.length < 2) return 'Please enter your name (2 characters minimum).';
+  return null;
+}
+
+function normalizeUrl(raw) {
+  const value = str(raw, 500);
+  if (!value) return { error: 'Website URL is required.' };
+  let parsed;
+  try {
+    parsed = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : `https://${value}`);
+  } catch {
+    return { error: 'Enter a valid website URL.' };
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return { error: 'Only http and https links are allowed.' };
+  }
+  if (!parsed.hostname || !parsed.hostname.includes('.')) {
+    return { error: 'Enter a valid website URL.' };
+  }
+  return { url: parsed.toString() };
+}
+
+function serializeUser(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    email: row.email,
+    role: row.role,
+    status: row.status,
+    createdAt: row.created_at ?? row.createdAt ?? null,
+    approvedAt: row.approved_at ?? row.approvedAt ?? null,
+    lastLoginAt: row.last_login_at ?? row.lastLoginAt ?? null,
   };
-  loadSession(ctx);
-
-  let match = null, pathMatched = false;
-  for (const r of routes) {
-    const m = r.re.exec(url.pathname);
-    if (!m) continue;
-    pathMatched = true;
-    if (r.method !== req.method) continue;
-    match = { r, m }; break;
-  }
-  if (!match) throw new HttpError(pathMatched ? 405 : 404, pathMatched ? 'Method not allowed.' : 'Not found.');
-  match.r.keys.forEach((k, i) => { ctx.params[k] = decodeURIComponent(match.m[i + 1]); });
-
-  const { auth } = match.r;
-  if (auth !== 'none') {
-    if (!ctx.user) throw new HttpError(401, 'Please log in.');
-    if ((auth === 'admin' || auth === 'owner') && ctx.user.role !== 'admin') throw new HttpError(403, 'Admins only.');
-    if (auth === 'owner' && !ctx.user.is_owner) throw new HttpError(403, 'Only the owner can do that.');
-  }
-  if (req.method !== 'GET' && req.method !== 'HEAD') {
-    // Requiring a JSON content type blocks plain cross-site <form> posts (they cannot send it).
-    if (!/^application\/json/i.test(req.headers['content-type'] || '')) throw new HttpError(415, 'Send JSON.');
-    ctx.body = await readJson(req, 12 * 1024 * 1024);
-  }
-  const out = await match.r.handler(ctx);
-  if (out !== undefined && !res.headersSent) send(res, 200, out);
 }
 
-const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
-  '.json': 'application/json', '.png': 'image/png', '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.webp': 'image/webp' };
-function serveStatic(req, res, url) {
-  if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); return res.end(); }
-  let rel;
-  try { rel = decodeURIComponent(url.pathname); } catch (e) { res.writeHead(400); return res.end(); }
-  if (rel === '/') rel = '/index.html';
-  const full = path.normalize(path.join(PUBLIC_DIR, rel));
-  if (!full.startsWith(PUBLIC_DIR + path.sep)) { res.writeHead(403); return res.end(); }
-  fs.readFile(full, (err, data) => {
-    if (err) { res.writeHead(404, { 'Content-Type': 'text/plain' }); return res.end('Not found'); }
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(full)] || 'application/octet-stream', 'Cache-Control': 'no-cache' });
-    res.end(req.method === 'HEAD' ? undefined : data);
-  });
+function serializeResource(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    url: row.url,
+    category: row.category,
+    icon: row.icon || null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 
-const server = http.createServer(async (req, res) => {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('Referrer-Policy', 'no-referrer');
-  try {
-    const url = new URL(req.url, 'http://localhost');
-    if (url.pathname.startsWith('/api/')) await handleApi(req, res, url);
-    else serveStatic(req, res, url);
-  } catch (err) {
-    if (res.headersSent) { try { res.end(); } catch (e) { /* ignore */ } return; }
-    if (err instanceof HttpError) return send(res, err.status, Object.assign({ error: err.message }, err.extra));
-    console.error(err);
-    send(res, 500, { error: 'Server error.' });
+/* ------------------------------------------------------------------ *
+ * Simple in-memory guard rails for credential endpoints
+ * ------------------------------------------------------------------ */
+
+const attempts = new Map();
+
+function attemptKey(req, email) {
+  const ip = req.socket.remoteAddress || 'unknown';
+  return `${ip}|${email || '-'}`;
+}
+
+function tooManyAttempts(key) {
+  const entry = attempts.get(key);
+  if (!entry) return false;
+  if (entry.resetAt < Date.now()) {
+    attempts.delete(key);
+    return false;
   }
-});
+  return entry.count >= 10;
+}
 
-/* ============ auth routes ============ */
-const DUMMY_HASH = bcrypt.hashSync('not-a-real-password', BCRYPT_COST);   // keeps timing equal for unknown usernames
-
-route('GET', '/api/status', 'none', () => {
-  const owner = db.prepare('SELECT 1 AS x FROM users WHERE is_owner = 1').get();
-  return { ownerExists: !!owner, setupCodeRequired: !owner && !!OWNER_SETUP_CODE, freeLogins: FREE_LOGINS };
-});
-
-route('GET', '/api/me', 'user', ctx => ({ user: publicUser(ctx.user) }));
-
-route('POST', '/api/auth/signup', 'none', async ctx => {
-  const { username, password, role, setupCode } = ctx.body;
-  if (!validUsername(username)) throw new HttpError(400, 'Username must be 3-32 characters: letters, numbers, dot, dash or underscore.');
-  if (!validPassword(password)) throw new HttpError(400, 'Password must be at least 8 characters (and at most 72 bytes).');
-  if (role !== 'viewer' && role !== 'admin') throw new HttpError(400, 'Choose Viewer or Admin.');
-  checkSignupLimit(ctx.ip);
-  const hash = await bcrypt.hash(password, BCRYPT_COST);
-
-  let result;
-  try {
-    result = tx(() => {
-      let isOwner = 0, status = 'active';
-      if (role === 'admin') {
-        const owner = db.prepare('SELECT 1 AS x FROM users WHERE is_owner = 1').get();
-        if (!owner) {
-          if (OWNER_SETUP_CODE && !safeEqual(typeof setupCode === 'string' ? setupCode : '', OWNER_SETUP_CODE)) throw new HttpError(403, 'Invalid setup code.');
-          isOwner = 1;                                   // first admin becomes the owner
-        } else status = 'pending';                       // later admins wait for the owner
-      } else status = 'pending';                         // viewers wait for an admin
-      db.prepare('INSERT INTO users(username, password_hash, role, is_owner, status, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(username, hash, role, isOwner, status, now());
-      return { isOwner, status };
-    });
-  } catch (e) {
-    if (e instanceof HttpError) throw e;
-    if (isUnique(e)) throw new HttpError(409, 'That username is already taken.');
-    throw e;
+function noteAttempt(key) {
+  const now = Date.now();
+  const entry = attempts.get(key);
+  if (!entry || entry.resetAt < now) {
+    attempts.set(key, { count: 1, resetAt: now + 10 * 60 * 1000 });
+    return;
   }
+  entry.count += 1;
+}
 
-  if (role === 'viewer') {
-    broadcast('refresh');
-    pushNotify(`New member request from "${username}". Open Nexus Hub to accept or decline.`);
-    return { ok: true, status: 'pending', message: 'Account created. An admin has to accept it before you can log in.' };
-  }
-  if (result.isOwner) return { ok: true, status: 'active', owner: true, message: 'Owner admin account created. Log in with Admin login.' };
-  broadcast('refresh', {}, true);
-  pushNotify(`New admin account request from "${username}". Open Nexus Hub to approve or decline.`);
-  return { ok: true, status: 'pending', message: 'Admin account requested. The owner has to approve it before you can log in.' };
-});
+function clearAttempts(key) {
+  attempts.delete(key);
+}
 
-// Shared credential check for both login flows. Never says which half was wrong.
-async function verifyCredentials(ctx, expectedRole) {
-  const { username, password } = ctx.body;
-  if (typeof username !== 'string' || typeof password !== 'string' || !username || !password || password.length > 200) {
-    throw new HttpError(400, 'Enter a username and password.');
+/* ------------------------------------------------------------------ *
+ * Bootstrap: administrator account created server-side from env vars
+ * ------------------------------------------------------------------ */
+
+function bootstrapAdmin() {
+  const email = normalizeEmail(process.env.ADMIN_EMAIL || '');
+  const password = process.env.ADMIN_PASSWORD || '';
+  if (!email) {
+    console.warn('[bootstrap] ADMIN_EMAIL not set — no administrator provisioned.');
+    return;
   }
-  const key = ctx.ip + '|' + username.toLowerCase();
-  checkLoginLimit(key);
-  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
-  const ok = await bcrypt.compare(password, user ? user.password_hash : DUMMY_HASH);
-  if (!user || !ok) { recordFailure(key); throw new HttpError(401, 'Wrong username or password.'); }
-  failures.delete(key);
-  if (user.role !== expectedRole) {
-    throw new HttpError(403, expectedRole === 'admin' ? 'That is a viewer account. Use Viewer login.' : 'That is an admin account. Use Admin login.');
+  if (validateEmail(email)) {
+    console.warn(`[bootstrap] ADMIN_EMAIL "${email}" is not a valid email — skipping.`);
+    return;
   }
-  const what = expectedRole === 'admin' ? 'admin account' : 'account';
-  if (user.status === 'pending') throw new HttpError(403, expectedRole === 'admin' ? 'Your admin account is still waiting for the owner to approve it.' : 'Your account is still waiting for an admin to accept it.');
-  if (user.status === 'declined') throw new HttpError(403, 'Your ' + what + ' request was declined.');
+  const existing = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+  const now = new Date().toISOString();
+  if (existing) {
+    db.prepare(
+      "UPDATE users SET role = 'admin', status = 'approved', updated_at = ?, approved_at = COALESCE(approved_at, ?) WHERE id = ?"
+    ).run(now, now, existing.id);
+    console.log(`[bootstrap] ensured administrator privileges for ${email}`);
+    return;
+  }
+  if (validatePassword(password)) {
+    console.warn(
+      '[bootstrap] ADMIN_PASSWORD is missing or shorter than 8 characters — administrator not created yet.'
+    );
+    return;
+  }
+  db.prepare(
+    `INSERT INTO users (name, email, password_hash, role, status, created_at, updated_at, approved_at)
+     VALUES (?, ?, ?, 'admin', 'approved', ?, ?, ?)`
+  ).run('Administrator', email, hashPassword(password), now, now, now);
+  console.log(`[bootstrap] created administrator ${email}`);
+}
+
+/* ------------------------------------------------------------------ *
+ * Route handlers
+ * ------------------------------------------------------------------ */
+
+function currentUser(req) {
+  const token = parseCookies(req)[COOKIE_NAME];
+  return userForToken(db, token);
+}
+
+function requireUser(req, res) {
+  const user = currentUser(req);
+  if (!user) {
+    sendError(res, 401, 'You need to sign in first.');
+    return null;
+  }
   return user;
 }
 
-route('POST', '/api/auth/login/viewer', 'none', async ctx => {
-  const user = await verifyCredentials(ctx, 'viewer');
-  startSession(ctx, user.id);
-  return { status: 'ok', user: publicUser(user) };
-});
+/** Approved members and administrators only. */
+function requireApproved(req, res) {
+  const user = requireUser(req, res);
+  if (!user) return null;
+  if (user.role !== 'admin' && user.status !== 'approved') {
+    const message =
+      user.status === 'suspended'
+        ? 'Your account is suspended. Contact the administrator.'
+        : user.status === 'rejected'
+          ? 'Your registration was not approved.'
+          : 'Your account is awaiting administrator approval.';
+    sendError(res, 403, message);
+    return null;
+  }
+  return user;
+}
 
-route('POST', '/api/auth/login/admin', 'none', async ctx => {
-  const user = await verifyCredentials(ctx, 'admin');
+function requireAdmin(req, res) {
+  const user = requireUser(req, res);
+  if (!user) return null;
+  if (user.role !== 'admin') {
+    sendError(res, 403, 'Administrator access required.');
+    return null;
+  }
+  return user;
+}
 
-  // The counter is bumped in a single conditional UPDATE, so simultaneous logins can never
-  // take more than FREE_LOGINS free passes, and clearing browser data changes nothing.
-  const free = db.prepare('UPDATE users SET login_count = login_count + 1 WHERE id = ? AND login_count < ?').run(user.id, FREE_LOGINS).changes === 1;
-  if (free) {
-    startSession(ctx, user.id);
-    const used = db.prepare('SELECT login_count FROM users WHERE id = ?').get(user.id).login_count;
-    return { status: 'ok', user: publicUser(user), freeLoginsUsed: used, freeLoginsTotal: FREE_LOGINS };
+async function handleRegister(req, res) {
+  const body = await readJson(req);
+  const name = str(body.name, 80);
+  const email = normalizeEmail(body.email);
+  const password = typeof body.password === 'string' ? body.password : '';
+
+  const nameError = validateName(name);
+  if (nameError) return sendError(res, 400, nameError);
+  const emailError = validateEmail(email);
+  if (emailError) return sendError(res, 400, emailError);
+  const passwordError = validatePassword(password);
+  if (passwordError) return sendError(res, 400, passwordError);
+
+  const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+  if (existing) {
+    return sendError(res, 409, 'An account with that email already exists. Try signing in.');
   }
 
-  expireStale();
-  const open = db.prepare("SELECT COUNT(*) AS n FROM login_attempts WHERE user_id = ? AND status = 'pending'").get(user.id).n;
-  if (open >= MAX_PENDING_PER_ACCOUNT) throw new HttpError(429, 'There are already several login requests waiting for approval on this account.');
+  const now = new Date().toISOString();
+  const info = db
+    .prepare(
+      `INSERT INTO users (name, email, password_hash, role, status, created_at, updated_at)
+       VALUES (?, ?, ?, 'member', 'pending', ?, ?)`
+    )
+    .run(name, email, hashPassword(password), now, now);
 
-  const claimToken = newToken();
-  const ua = String(ctx.req.headers['user-agent'] || '').slice(0, 200);
-  const info = db.prepare('INSERT INTO login_attempts(user_id, claim_hash, status, ip, user_agent, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(user.id, sha256(claimToken), 'pending', ctx.ip, ua, now(), now() + APPROVAL_TTL_MS);
-  const attemptId = Number(info.lastInsertRowid);
-  broadcast('login-attempt', { id: attemptId, username: user.username, ip: ctx.ip }, true);
-  pushNotify(`Admin login attempt for "${user.username}" from ${ctx.ip}. Open Nexus Hub to accept or decline.`);
-  return {
-    status: 'pending', attemptId, claimToken, expiresAt: now() + APPROVAL_TTL_MS,
-    selfApproval: !!user.is_owner     // the owner approves their own extra logins from another logged-in session
+  const userId = Number(info.lastInsertRowid);
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+
+  // Sign the member in immediately. No email confirmation step exists anywhere
+  // in this flow: the account exists as soon as this insert commits.
+  const session = createSession(db, userId);
+  db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(now, userId);
+
+  sendJson(
+    res,
+    201,
+    {
+      user: serializeUser({ ...user, last_login_at: now }),
+      message: 'Account created. Administrator approval is required before directory access.',
+    },
+    { 'Set-Cookie': sessionCookie(session.token, req, Math.floor(session.ttlMs / 1000)) }
+  );
+}
+
+async function handleLogin(req, res) {
+  const body = await readJson(req);
+  const email = normalizeEmail(body.email);
+  const password = typeof body.password === 'string' ? body.password : '';
+  const key = attemptKey(req, email);
+
+  if (tooManyAttempts(key)) {
+    return sendError(res, 429, 'Too many attempts. Please wait a few minutes and try again.');
+  }
+
+  const row = email ? db.prepare('SELECT * FROM users WHERE email = ?').get(email) : null;
+  if (!row || !verifyPassword(password, row.password_hash)) {
+    noteAttempt(key);
+    return sendError(res, 401, 'Incorrect email or password.');
+  }
+  if (row.status === 'rejected') {
+    return sendError(res, 403, 'This registration was not approved by the administrator.');
+  }
+
+  clearAttempts(key);
+  const now = new Date().toISOString();
+  const session = createSession(db, row.id);
+  db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(now, row.id);
+
+  sendJson(
+    res,
+    200,
+    { user: serializeUser({ ...row, last_login_at: now }) },
+    { 'Set-Cookie': sessionCookie(session.token, req, Math.floor(session.ttlMs / 1000)) }
+  );
+}
+
+function handleLogout(req, res) {
+  const token = parseCookies(req)[COOKIE_NAME];
+  destroySession(db, token);
+  sendJson(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie('', req, 0) });
+}
+
+function handleMe(req, res) {
+  const user = currentUser(req);
+  sendJson(res, 200, { user: user || null });
+}
+
+function handleDirectory(req, res, url) {
+  const user = requireApproved(req, res);
+  if (!user) return;
+
+  const q = str(url.searchParams.get('q'), 120);
+  const category = str(url.searchParams.get('category'), 40);
+  const clauses = [];
+  const params = [];
+
+  if (q) {
+    clauses.push('(name LIKE ? OR description LIKE ? OR url LIKE ?)');
+    const like = `%${q.replace(/[%_]/g, (m) => `\\${m}`)}%`;
+    params.push(like, like, like);
+  }
+  if (category && CATEGORIES.includes(category)) {
+    clauses.push('category = ?');
+    params.push(category);
+  }
+
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  const rows = db
+    .prepare(
+      `SELECT * FROM resources ${where.replace(/LIKE \?/g, "LIKE ? ESCAPE '\\'")}
+       ORDER BY datetime(created_at) DESC, id DESC`
+    )
+    .all(...params);
+
+  sendJson(res, 200, {
+    resources: rows.map(serializeResource),
+    total: rows.length,
+    categories: CATEGORIES,
+    viewer: { name: user.name, role: user.role, status: user.status },
+  });
+}
+
+function handleAdminStats(req, res) {
+  if (!requireAdmin(req, res)) return;
+  const count = (sql, ...params) => Number(db.prepare(sql).get(...params).c);
+  const stats = {
+    totalMembers: count('SELECT COUNT(*) AS c FROM users'),
+    pendingMembers: count("SELECT COUNT(*) AS c FROM users WHERE status = 'pending'"),
+    approvedMembers: count("SELECT COUNT(*) AS c FROM users WHERE status = 'approved'"),
+    suspendedMembers: count("SELECT COUNT(*) AS c FROM users WHERE status = 'suspended'"),
+    rejectedMembers: count("SELECT COUNT(*) AS c FROM users WHERE status = 'rejected'"),
+    totalResources: count('SELECT COUNT(*) AS c FROM resources'),
   };
-});
-
-function getAttempt(ctx) {
-  const id = Number(ctx.params.id);
-  const token = ctx.body && ctx.body.claimToken;
-  const a = db.prepare('SELECT * FROM login_attempts WHERE id = ?').get(id);
-  if (!a || typeof token !== 'string' || !safeEqual(sha256(token), a.claim_hash)) throw new HttpError(404, 'Unknown login request.');
-  if ((a.status === 'pending' || a.status === 'approved') && a.expires_at <= now()) {
-    db.prepare("UPDATE login_attempts SET status = 'expired', decided_at = ? WHERE id = ?").run(now(), id);
-    a.status = 'expired';
-  }
-  return a;
+  const byCategory = db
+    .prepare('SELECT category, COUNT(*) AS c FROM resources GROUP BY category')
+    .all()
+    .reduce((acc, row) => {
+      acc[row.category] = Number(row.c);
+      return acc;
+    }, {});
+  sendJson(res, 200, { stats, byCategory, categories: CATEGORIES });
 }
 
-// The waiting browser polls this. Approval is only turned into a session here, in the browser that asked.
-route('POST', '/api/auth/attempts/:id/claim', 'none', ctx => {
-  const a = getAttempt(ctx);
-  if (a.status === 'pending') return { status: 'pending', expiresAt: a.expires_at };
-  if (a.status !== 'approved') return { status: a.status };
-  const user = tx(() => {
-    const r = db.prepare("UPDATE login_attempts SET status = 'claimed' WHERE id = ? AND status = 'approved'").run(a.id);
-    if (r.changes !== 1) return null;
-    db.prepare('UPDATE users SET login_count = login_count + 1 WHERE id = ?').run(a.user_id);
-    return db.prepare("SELECT * FROM users WHERE id = ? AND status = 'active'").get(a.user_id);
+function handleAdminMembers(req, res, url) {
+  if (!requireAdmin(req, res)) return;
+  const status = str(url.searchParams.get('status'), 20) || 'all';
+  const q = str(url.searchParams.get('q'), 120);
+  const clauses = [];
+  const params = [];
+  if (['pending', 'approved', 'suspended', 'rejected'].includes(status)) {
+    clauses.push('status = ?');
+    params.push(status);
+  }
+  if (q) {
+    clauses.push('(name LIKE ? OR email LIKE ?)');
+    params.push(`%${q}%`, `%${q}%`);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  const rows = db
+    .prepare(`SELECT * FROM users ${where} ORDER BY datetime(created_at) DESC, id DESC`)
+    .all(...params);
+  sendJson(res, 200, { members: rows.map(serializeUser), filter: status });
+}
+
+async function handleMemberStatus(req, res, id) {
+  if (!requireAdmin(req, res)) return;
+  const body = await readJson(req);
+  const status = str(body.status, 20);
+  if (!['approved', 'suspended', 'pending', 'rejected'].includes(status)) {
+    return sendError(res, 400, 'Unsupported member status.');
+  }
+  const member = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+  if (!member) return sendError(res, 404, 'Member not found.');
+  if (member.role === 'admin' && status !== 'approved') {
+    return sendError(res, 400, 'Administrator accounts cannot be suspended.');
+  }
+  const now = new Date().toISOString();
+  db.prepare(
+    'UPDATE users SET status = ?, updated_at = ?, approved_at = CASE WHEN ? = \'approved\' THEN COALESCE(approved_at, ?) ELSE approved_at END WHERE id = ?'
+  ).run(status, now, status, now, id);
+
+  const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+  sendJson(res, 200, { member: serializeUser(updated) });
+}
+
+function resourceInput(body) {
+  const name = str(body.name, 120);
+  const description = str(body.description, 600);
+  const category = str(body.category, 40);
+  const icon = str(body.icon, 8);
+  const urlResult = normalizeUrl(body.url);
+
+  if (!name) return { error: 'Resource name is required.' };
+  if (description.length < 4) return { error: 'Please add a short description.' };
+  if (!CATEGORIES.includes(category)) return { error: 'Choose a valid category.' };
+  if (urlResult.error) return { error: urlResult.error };
+  if (icon && !/^\p{Extended_Pictographic}+$/u.test(icon)) {
+    return { error: 'Icon must be a single emoji.' };
+  }
+  return { name, description, category, icon: icon || null, url: urlResult.url };
+}
+
+async function handleCreateResource(req, res) {
+  const admin = requireAdmin(req, res);
+  if (!admin) return;
+  const body = await readJson(req);
+  const input = resourceInput(body);
+  if (input.error) return sendError(res, 400, input.error);
+
+  const now = new Date().toISOString();
+  const info = db
+    .prepare(
+      `INSERT INTO resources (name, description, url, category, icon, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(input.name, input.description, input.url, input.category, input.icon, admin.id, now, now);
+  const created = db.prepare('SELECT * FROM resources WHERE id = ?').get(Number(info.lastInsertRowid));
+  sendJson(res, 201, { resource: serializeResource(created) });
+}
+
+async function handleUpdateResource(req, res, id) {
+  if (!requireAdmin(req, res)) return;
+  const existing = db.prepare('SELECT * FROM resources WHERE id = ?').get(id);
+  if (!existing) return sendError(res, 404, 'Resource not found.');
+  const body = await readJson(req);
+  const input = resourceInput({
+    name: body.name ?? existing.name,
+    description: body.description ?? existing.description,
+    url: body.url ?? existing.url,
+    category: body.category ?? existing.category,
+    icon: body.icon === undefined ? existing.icon ?? '' : body.icon,
   });
-  if (!user) return { status: 'claimed' };
-  startSession(ctx, user.id);
-  return { status: 'ok', user: publicUser(user) };
-});
+  if (input.error) return sendError(res, 400, input.error);
 
-route('POST', '/api/auth/attempts/:id/cancel', 'none', ctx => {
-  const a = getAttempt(ctx);
-  db.prepare("UPDATE login_attempts SET status = 'cancelled', decided_at = ? WHERE id = ? AND status = 'pending'").run(now(), a.id);
-  broadcast('refresh', {}, true);
-  return { ok: true };
-});
+  db.prepare(
+    'UPDATE resources SET name = ?, description = ?, url = ?, category = ?, icon = ?, updated_at = ? WHERE id = ?'
+  ).run(input.name, input.description, input.url, input.category, input.icon, new Date().toISOString(), id);
+  const updated = db.prepare('SELECT * FROM resources WHERE id = ?').get(id);
+  sendJson(res, 200, { resource: serializeResource(updated) });
+}
 
-route('POST', '/api/auth/logout', 'none', ctx => {
-  if (ctx.sessionHash) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(ctx.sessionHash);
-  ctx.res.setHeader('Set-Cookie', `${COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${ctx.secure ? '; Secure' : ''}`);
-  return { ok: true };
-});
+function handleDeleteResource(req, res, id) {
+  if (!requireAdmin(req, res)) return;
+  const existing = db.prepare('SELECT id FROM resources WHERE id = ?').get(id);
+  if (!existing) return sendError(res, 404, 'Resource not found.');
+  db.prepare('DELETE FROM resources WHERE id = ?').run(id);
+  sendJson(res, 200, { ok: true, id: Number(id) });
+}
 
-/* ============ approvals and member management (admins) ============ */
-function pendingList(user) {
-  expireStale();
-  const out = { logins: [], accounts: [], members: [] };
-  out.members = db.prepare("SELECT id, username, created_at AS createdAt FROM users WHERE role = 'viewer' AND status = 'pending' ORDER BY id").all().map(x => ({ ...x }));
-  if (user.is_owner) {                      // admin logins and admin sign-ups are the owner's call
-    out.logins = db.prepare(`SELECT a.id, u.username, u.is_owner AS isOwner, a.ip, a.user_agent AS userAgent, a.created_at AS createdAt, a.expires_at AS expiresAt
-                             FROM login_attempts a JOIN users u ON u.id = a.user_id
-                             WHERE a.status = 'pending' AND a.expires_at > ? ORDER BY a.id`).all(now()).map(x => ({ ...x, isOwner: !!x.isOwner }));
-    out.accounts = db.prepare("SELECT id, username, created_at AS createdAt FROM users WHERE role = 'admin' AND status = 'pending' ORDER BY id").all().map(x => ({ ...x }));
+function handleAdminResources(req, res) {
+  if (!requireAdmin(req, res)) return;
+  const rows = db
+    .prepare('SELECT * FROM resources ORDER BY datetime(created_at) DESC, id DESC')
+    .all();
+  sendJson(res, 200, { resources: rows.map(serializeResource), categories: CATEGORIES });
+}
+
+async function handleAccountUpdate(req, res) {
+  const user = requireUser(req, res);
+  if (!user) return;
+  const body = await readJson(req);
+  const name = str(body.name, 80);
+  const nameError = validateName(name);
+  if (nameError) return sendError(res, 400, nameError);
+  const now = new Date().toISOString();
+  db.prepare('UPDATE users SET name = ?, updated_at = ? WHERE id = ?').run(name, now, user.id);
+  const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
+  sendJson(res, 200, { user: serializeUser(updated) });
+}
+
+async function handlePasswordChange(req, res) {
+  const user = requireUser(req, res);
+  if (!user) return;
+  const body = await readJson(req);
+  const currentPassword = typeof body.currentPassword === 'string' ? body.currentPassword : '';
+  const newPassword = typeof body.newPassword === 'string' ? body.newPassword : '';
+  const row = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(user.id);
+  if (!row || !verifyPassword(currentPassword, row.password_hash)) {
+    return sendError(res, 400, 'Current password is incorrect.');
   }
-  return out;
+  const passwordError = validatePassword(newPassword);
+  if (passwordError) return sendError(res, 400, passwordError);
+  db.prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?').run(
+    hashPassword(newPassword),
+    new Date().toISOString(),
+    user.id
+  );
+  sendJson(res, 200, { ok: true, message: 'Password updated.' });
 }
-route('GET', '/api/admin/pending', 'admin', ctx => pendingList(ctx.user));
 
-route('GET', '/api/admin/events', 'admin', ctx => {
-  const { req, res } = ctx;
-  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
-  res.write('retry: 3000\n\nevent: refresh\ndata: {}\n\n');
-  const stream = { res, isOwner: !!ctx.user.is_owner };
-  adminStreams.add(stream);
-  req.on('close', () => adminStreams.delete(stream));
-});
+/* ------------------------------------------------------------------ *
+ * Static assets + SPA fallback
+ * ------------------------------------------------------------------ */
 
-function decisionOf(ctx) {
-  const d = ctx.body && ctx.body.decision;
-  if (d !== 'accept' && d !== 'decline') throw new HttpError(400, 'Decision must be accept or decline.');
-  return d;
+function serveStatic(req, res, pathname) {
+  if (pathname.includes('..')) return sendError(res, 400, 'Bad path.');
+  const relative = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
+  const filePath = path.join(PUBLIC_DIR, relative);
+  if (!filePath.startsWith(PUBLIC_DIR)) return sendError(res, 400, 'Bad path.');
+
+  fs.readFile(filePath, (err, data) => {
+    if (err) return serveSpa(res);
+    const ext = path.extname(filePath).toLowerCase();
+    const cache = ext === '.html' ? 'no-cache' : 'public, max-age=300';
+    res.writeHead(200, {
+      'Content-Type': MIME[ext] || 'application/octet-stream',
+      'Cache-Control': cache,
+      'X-Content-Type-Options': 'nosniff',
+    });
+    res.end(data);
+  });
 }
-route('POST', '/api/admin/logins/:id/decision', 'owner', ctx => {
-  const d = decisionOf(ctx);
-  const r = db.prepare("UPDATE login_attempts SET status = ?, decided_at = ? WHERE id = ? AND status = 'pending' AND expires_at > ?")
-    .run(d === 'accept' ? 'approved' : 'declined', now(), Number(ctx.params.id), now());
-  if (r.changes !== 1) throw new HttpError(409, 'That request was already handled or has expired.');
-  broadcast('refresh');
-  return { ok: true };
-});
-route('POST', '/api/admin/accounts/:id/decision', 'owner', ctx => {
-  const d = decisionOf(ctx);
-  const r = db.prepare("UPDATE users SET status = ? WHERE id = ? AND role = 'admin' AND status = 'pending'")
-    .run(d === 'accept' ? 'active' : 'declined', Number(ctx.params.id));
-  if (r.changes !== 1) throw new HttpError(409, 'That account request was already handled.');
-  broadcast('refresh');
-  return { ok: true };
-});
 
-// New viewer accounts: any admin can accept or decline.
-route('POST', '/api/admin/members/:id/decision', 'admin', ctx => {
-  const d = decisionOf(ctx);
-  const r = db.prepare("UPDATE users SET status = ? WHERE id = ? AND role = 'viewer' AND status = 'pending'")
-    .run(d === 'accept' ? 'active' : 'declined', Number(ctx.params.id));
-  if (r.changes !== 1) throw new HttpError(409, 'That member request was already handled.');
-  broadcast('refresh');
-  return { ok: true };
-});
+let indexHtmlPromise = null;
+function serveSpa(res) {
+  if (!indexHtmlPromise) {
+    indexHtmlPromise = fs.promises.readFile(path.join(PUBLIC_DIR, 'index.html'));
+  }
+  indexHtmlPromise
+    .then((html) => {
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-cache',
+      });
+      res.end(html);
+    })
+    .catch((error) => {
+      console.error('[static] unable to read index.html', error.message);
+      sendError(res, 500, 'Application shell unavailable.');
+    });
+}
 
-route('GET', '/api/admin/members', 'admin', () =>
-  db.prepare("SELECT id, username, role, is_owner AS isOwner, status, created_at AS createdAt FROM users ORDER BY is_owner DESC, role, username COLLATE NOCASE")
-    .all().map(x => ({ ...x, isOwner: !!x.isOwner })));
+/* ------------------------------------------------------------------ *
+ * Router
+ * ------------------------------------------------------------------ */
 
-// Promote an accepted viewer to admin. They get the same two free logins, then the approval rule.
-route('POST', '/api/admin/members/:id/promote', 'admin', ctx => {
-  const r = db.prepare("UPDATE users SET role = 'admin', login_count = 0 WHERE id = ? AND role = 'viewer' AND status = 'active'").run(Number(ctx.params.id));
-  if (r.changes !== 1) throw new HttpError(409, 'Only accepted viewers can be promoted.');
-  broadcast('refresh');
-  return { ok: true };
-});
+const SPA_ROUTES = new Set(['/', '/login', '/register', '/directory', '/admin', '/account', '/pending']);
 
-// Remove a member entirely (their sessions and login requests go with them). Only the owner can remove admins.
-route('DELETE', '/api/admin/members/:id', 'admin', ctx => {
-  const id = Number(ctx.params.id);
-  const target = db.prepare('SELECT id, role, is_owner FROM users WHERE id = ?').get(id);
-  if (!target) throw new HttpError(404, 'Member not found.');
-  if (target.is_owner) throw new HttpError(403, 'The owner account cannot be removed.');
-  if (target.id === ctx.user.id) throw new HttpError(400, 'You cannot remove your own account.');
-  if (target.role === 'admin' && !ctx.user.is_owner) throw new HttpError(403, 'Only the owner can remove admins.');
-  db.prepare('DELETE FROM users WHERE id = ?').run(id);
-  broadcast('refresh');
-  return { ok: true };
-});
+async function route(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const { pathname } = url;
+  const method = req.method || 'GET';
 
-/* ============ links ============ */
-const linkCols = 'id, title, url, category, status, logo';
-route('GET', '/api/links', 'user', () => db.prepare(`SELECT ${linkCols} FROM links ORDER BY id`).all().map(x => ({ ...x })));
-
-route('POST', '/api/links', 'admin', ctx => {
-  const l = sanitizeLink(ctx.body);
-  if (!l) throw new HttpError(400, 'Enter a valid http(s) URL.');
-  try {
-    const info = db.prepare('INSERT INTO links(title, url, category, status, logo, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(l.title, l.url, l.category, l.status, l.logo, now());
-    return { id: Number(info.lastInsertRowid) };
-  } catch (e) { if (isUnique(e)) throw new HttpError(409, 'That link already exists.'); throw e; }
-});
-
-route('PUT', '/api/links/:id', 'admin', ctx => {
-  const l = sanitizeLink(ctx.body);
-  if (!l) throw new HttpError(400, 'Enter a valid http(s) URL.');
-  try {
-    const r = db.prepare('UPDATE links SET title = ?, url = ?, category = ?, status = ?, logo = ? WHERE id = ?').run(l.title, l.url, l.category, l.status, l.logo, Number(ctx.params.id));
-    if (!r.changes) throw new HttpError(404, 'Link not found.');
-    return { ok: true };
-  } catch (e) { if (isUnique(e)) throw new HttpError(409, 'Another link already uses that URL.'); throw e; }
-});
-
-route('DELETE', '/api/links/:id', 'admin', ctx => {
-  db.prepare('DELETE FROM links WHERE id = ?').run(Number(ctx.params.id));
-  return { ok: true };
-});
-
-route('POST', '/api/links/bulk', 'admin', ctx => {
-  const items = ctx.body && ctx.body.items;
-  if (!Array.isArray(items) || !items.length) throw new HttpError(400, 'Nothing to add.');
-  if (items.length > 1000) throw new HttpError(400, 'Add at most 1000 links at a time.');
-  return tx(() => {
-    const out = { added: 0, replaced: 0, skipped: 0, invalid: 0 };
-    for (const item of items) {
-      const l = sanitizeLink(item);
-      if (!l) { out.invalid++; continue; }
-      const existing = db.prepare('SELECT id FROM links WHERE url = ?').get(l.url);
-      if (existing) {
-        if (!(item && item.replaceExisting)) { out.skipped++; continue; }
-        db.prepare('DELETE FROM links WHERE id = ?').run(existing.id);
-        out.replaced++;
+  if (pathname.startsWith('/api/')) {
+    try {
+      if (pathname === '/api/health' && method === 'GET') {
+        return sendJson(res, 200, {
+          ok: true,
+          service: 'nexus-hub',
+          database: 'sqlite',
+          uptime: Math.round(process.uptime()),
+        });
       }
-      db.prepare('INSERT INTO links(title, url, category, status, logo, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(l.title, l.url, l.category, l.status, l.logo, now());
-      out.added++;
+      if (pathname === '/api/categories' && method === 'GET') {
+        return sendJson(res, 200, { categories: CATEGORIES });
+      }
+      if (pathname === '/api/auth/register' && method === 'POST') return await handleRegister(req, res);
+      if (pathname === '/api/auth/login' && method === 'POST') return await handleLogin(req, res);
+      if (pathname === '/api/auth/logout' && method === 'POST') return handleLogout(req, res);
+      if (pathname === '/api/auth/me' && method === 'GET') return handleMe(req, res);
+      if (pathname === '/api/directory' && method === 'GET') return handleDirectory(req, res, url);
+      if (pathname === '/api/account' && method === 'PATCH') return await handleAccountUpdate(req, res);
+      if (pathname === '/api/account/password' && method === 'POST')
+        return await handlePasswordChange(req, res);
+
+      if (pathname === '/api/admin/stats' && method === 'GET') return handleAdminStats(req, res);
+      if (pathname === '/api/admin/members' && method === 'GET')
+        return handleAdminMembers(req, res, url);
+      if (pathname === '/api/admin/resources' && method === 'GET')
+        return handleAdminResources(req, res);
+      if (pathname === '/api/admin/resources' && method === 'POST')
+        return await handleCreateResource(req, res);
+
+      const memberMatch = pathname.match(/^\/api\/admin\/members\/(\d+)\/status$/);
+      if (memberMatch && method === 'POST')
+        return await handleMemberStatus(req, res, Number(memberMatch[1]));
+
+      const resourceMatch = pathname.match(/^\/api\/admin\/resources\/(\d+)$/);
+      if (resourceMatch) {
+        const id = Number(resourceMatch[1]);
+        if (method === 'PATCH' || method === 'PUT') return await handleUpdateResource(req, res, id);
+        if (method === 'DELETE') return handleDeleteResource(req, res, id);
+      }
+
+      return sendError(res, 404, 'Unknown API endpoint.');
+    } catch (error) {
+      const status = error.status || 500;
+      if (status >= 500) console.error('[api]', error);
+      if (!res.headersSent) sendError(res, status, error.message || 'Unexpected server error.');
+      return;
     }
-    return out;
+  }
+
+  if (method !== 'GET' && method !== 'HEAD') {
+    return sendError(res, 405, 'Method not allowed.');
+  }
+
+  if (pathname !== '/' && /\/$/.test(pathname)) {
+    res.writeHead(301, { Location: pathname.replace(/\/+$/, '') });
+    return res.end();
+  }
+
+  if (SPA_ROUTES.has(pathname) || pathname === '/index.html') {
+    return serveStatic(req, res, pathname === '/index.html' ? '/' : pathname);
+  }
+
+  if (path.extname(pathname)) return serveStatic(req, res, pathname);
+  return serveSpa(res);
+}
+
+/* ------------------------------------------------------------------ *
+ * Boot
+ * ------------------------------------------------------------------ */
+
+purgeExpiredSessions(db);
+bootstrapAdmin();
+
+const server = http.createServer((req, res) => {
+  route(req, res).catch((error) => {
+    console.error('[fatal]', error);
+    if (!res.headersSent) sendError(res, 500, 'Unexpected server error.');
   });
 });
 
-/* ============ start ============ */
+server.on('error', (error) => {
+  console.error('[server] error', error);
+  process.exitCode = 1;
+});
+
 if (require.main === module) {
   server.listen(PORT, HOST, () => {
-    console.log(`Nexus Hub running at http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
-    if (!db.prepare('SELECT 1 AS x FROM users WHERE is_owner = 1').get()) {
-      console.log('No owner yet: the first person to sign up as Admin becomes the owner.' + (OWNER_SETUP_CODE ? ' (a setup code is required)' : ''));
-    }
+    console.log(`NEXUS HUB listening on http://${HOST}:${PORT}`);
+    console.log(`Database: ${getDbPath()}`);
   });
 }
-module.exports = { server };
+
+module.exports = { server, app: route, db, bootstrapAdmin };
