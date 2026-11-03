@@ -12,6 +12,7 @@ const {
   destroySession,
   purgeExpiredSessions,
   userForToken,
+  SESSION_TTL_MS,
 } = require('./auth');
 
 const PORT = Number(process.env.PORT) || 3000;
@@ -342,7 +343,7 @@ async function handleRegister(req, res) {
       user: serializeUser({ ...user, last_login_at: now }),
       message: 'Account created. Administrator approval is required before directory access.',
     },
-    { 'Set-Cookie': sessionCookie(session.token, req, Math.floor(session.ttlMs / 1000)) }
+    { 'Set-Cookie': sessionCookie(session.token, req, Math.floor(SESSION_TTL_MS / 1000)) }
   );
 }
 
@@ -374,7 +375,7 @@ async function handleLogin(req, res) {
     res,
     200,
     { user: serializeUser({ ...row, last_login_at: now }) },
-    { 'Set-Cookie': sessionCookie(session.token, req, Math.floor(session.ttlMs / 1000)) }
+    { 'Set-Cookie': sessionCookie(session.token, req, Math.floor(SESSION_TTL_MS / 1000)) }
   );
 }
 
@@ -657,6 +658,15 @@ async function route(req, res) {
       }
       if (pathname === '/api/categories' && method === 'GET') {
         return sendJson(res, 200, { categories: CATEGORIES });
+      }
+      if (pathname === '/api/public/stats' && method === 'GET') {
+        // Aggregate counts only. No member names, emails or resource rows leak
+        // to unauthenticated visitors.
+        const total = Number(db.prepare('SELECT COUNT(*) AS c FROM resources').get().c);
+        const members = Number(
+          db.prepare("SELECT COUNT(*) AS c FROM users WHERE status = 'approved'").get().c
+        );
+        return sendJson(res, 200, { resources: total, approvedMembers: members });
       }
       if (pathname === '/api/auth/register' && method === 'POST') return await handleRegister(req, res);
       if (pathname === '/api/auth/login' && method === 'POST') return await handleLogin(req, res);
