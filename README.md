@@ -1,57 +1,150 @@
-# Nexus Hub
+# NEXUS HUB
 
-Link hub with a signup landing page, viewer login, and an admin login that is gated by a
-"two free logins, then the owner must approve" rule. Links live on the server.
+**Curated resources. One place.**
 
-## Run it (needs Node 22.5 or newer)
+A members-only resource directory with real server-side authentication, administrator
+approval, and a persistent SQLite database. No email confirmation, no OTP codes, no
+magic links — an account works the moment it is created.
 
-    npm install
-    npm start
+## Stack
 
-Open http://localhost:3000. The first person who signs up as **Admin** becomes the **owner**.
+| Layer | Choice |
+| --- | --- |
+| Server | Node.js `node:http` (no web framework) |
+| Database | SQLite via the built-in `node:sqlite` module (WAL mode) |
+| Passwords | `scrypt` via `node:crypto` with a per-user salt |
+| Sessions | Opaque 256-bit tokens, SHA-256 hashed at rest, `HttpOnly` cookies |
+| Frontend | Vanilla ES modules + CSS (no build step) |
+| Dependencies | **None** — only Node built-ins |
 
-## How the rules work
+Requires **Node 22.13+** (the release where `node:sqlite` no longer needs a flag).
 
-* **Signup page** is the landing page. "Admin login" and "Viewer login" buttons are at the bottom.
-* **Viewer** accounts must be **accepted by an admin** before they can log in (bell icon or the Members screen). Once accepted they can see and launch links, nothing else.
-* **Members screen (admins):** lists everyone with their role. Admins can accept or decline new viewers, **Make admin** (promote an accepted viewer), and **Remove** a member (signs them out at once; the username can be used again). Only the owner can remove other admins, and the owner account can't be removed.
-* A promoted viewer becomes a normal admin, so the two-free-logins-then-approval rule applies to them from then on.
-* **Admin** accounts: the first one is the owner. Later admin signups wait until the owner accepts them (bell icon).
-* **Admin login rule (per account):** logins 1 and 2 are automatic. From login 3 on, the person is held on a
-  "Waiting for approval" screen and the owner gets a live notification (toast + bell badge, optional desktop alert,
-  optional phone push) with **Accept** / **Decline**. Accept signs the waiting browser in; Decline or no answer
-  within `APPROVAL_TTL_MINUTES` rejects it.
-* The login counter is stored in the database and bumped by one atomic SQL statement, so clearing browser data or
-  firing many logins at once cannot get more than two free logins.
-* The owner's own 3rd+ login must be approved from another browser/device where the owner is already logged in.
-  If you are locked out: `npm run admin -- approve-login <id>` (the waiting screen shows the id),
-  or `npm run admin -- reset-logins <username>` to hand out two fresh free logins.
+## Run locally
 
-## Notifications (delivery choice)
+```bash
+npm start                       # http://localhost:3000
+```
 
-Server-Sent Events: the owner's open page keeps a one-way stream open and the server pushes events to it.
-It is the simplest reliable option here (no extra service, auto-reconnects). If the owner is not logged in anywhere,
-the request simply waits; it is shown the next time they open the app. Set `NOTIFY_URL` (ntfy.sh) for push to a phone.
+```bash
+ADMIN_EMAIL=altsamiul@gmail.com \
+ADMIN_PASSWORD='use-a-real-password' \
+DB_PATH=./data/nexus.db \
+npm start
+```
+
+## Routes
+
+| Route | Access |
+| --- | --- |
+| `/` | Public landing page |
+| `/login` | Public |
+| `/register` | Public — creates a **pending** account |
+| `/directory` | Approved members and administrators only |
+| `/admin` | Administrators only (server-enforced) |
+| `/account` | Any signed-in account |
+
+## How approval works
+
+1. Anyone can register with a name, email and password.
+2. The account is created with `status = pending` and the session is issued
+   immediately — there is no verification email anywhere in the flow.
+3. A pending account sees an approval-pending screen. `/api/directory` returns
+   `403` for it.
+4. An administrator approves, suspends, restores or rejects the account.
+5. Approval is checked **on every request from the database**, so suspending a
+   member invalidates their existing session immediately.
+
+## Administrator provisioning
+
+Administrator rights are **never** granted by comparing an email in the frontend.
+The account is created or promoted server-side at boot from environment variables:
+
+```
+ADMIN_EMAIL=altsamiul@gmail.com
+ADMIN_PASSWORD=<at least 8 characters>
+```
+
+On startup the server promotes the existing account for `ADMIN_EMAIL` to
+`role = admin, status = approved` (re-applying this if the account already exists),
+or creates it with a scrypt password hash when it does not. `ADMIN_PASSWORD` is only
+read at boot and is never sent to the browser.
+
+If `ADMIN_EMAIL` is unset the server logs a warning and simply provisions no
+administrator; it never falls back to a hard-coded credential.
+
+## API
+
+### Public / session
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/health` | Liveness probe |
+| `GET` | `/api/categories` | The seven categories |
+| `GET` | `/api/public/stats` | Aggregate resource count (no member data) |
+| `POST` | `/api/auth/register` | Create account (`pending`) + session |
+| `POST` | `/api/auth/login` | Sign in |
+| `POST` | `/api/auth/logout` | Destroy session |
+| `GET` | `/api/auth/me` | Current user or `null` |
+
+### Member
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/directory?q=&category=` | Approved members only |
+| `PATCH` | `/api/account` | Update own name |
+| `POST` | `/api/account/password` | Change password |
+
+### Administrator
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/admin/stats` | Member + resource totals, per-category counts |
+| `GET` | `/api/admin/members?status=&q=` | List / filter / search members |
+| `POST` | `/api/admin/members/:id/status` | `approved` · `suspended` · `pending` · `rejected` |
+| `GET` | `/api/admin/resources` | Full resource list |
+| `POST` | `/api/admin/resources` | Create resource |
+| `PATCH` | `/api/admin/resources/:id` | Update resource |
+| `DELETE` | `/api/admin/resources/:id` | Delete resource |
 
 ## Security notes
 
-* Passwords are hashed with bcrypt (cost 12). Sessions are random tokens in an HttpOnly cookie, stored hashed.
-* Run it behind HTTPS if it is on the internet, and set `TRUST_PROXY=1` there.
-* Set `OWNER_SETUP_CODE` before exposing it publicly so no one else can claim the owner account first.
-* Login attempts are rate-limited per address + username. Rate limits reset when the server restarts.
-* Back up `data/nexushub.db`. Deleting it resets everything.
+* Every permission decision is made on the server from the session's database row;
+  the frontend only mirrors the result.
+* Resource URLs must parse as `http`/`https` with a dotted hostname, so
+  `javascript:` and `data:` URLs are rejected.
+* Passwords are hashed with `scrypt`; comparisons use `timingSafeEqual`.
+* Session tokens are stored only as SHA-256 hashes, so a database read cannot
+  reconstruct a usable cookie.
+* Login is rate-limited per IP + email pair (10 attempts / 10 minutes).
+* Session cookies are `HttpOnly`, `SameSite=Lax`, and `Secure` behind HTTPS.
+* No secrets are ever included in the client bundle.
+* Escape hatch: administrators cannot be suspended through the member endpoint.
 
-## Server tool
+## Tests
 
-    npm run admin -- list
-    npm run admin -- approve-login 7
-    npm run admin -- approve-account someadmin
-    npm run admin -- reset-password someuser "new password"
-    npm run admin -- reset-logins someadmin
+```bash
+npm test
+```
 
-## Files
+`test/workflow.test.js` boots the real server against a temporary database and
+walks the complete workflow: registration with no email confirmation → immediate
+sign-in → pending gating → admin approval → directory access → resource
+create/edit/delete → suspension and restore → full server restart to prove
+persistence.
 
-    server.js      HTTP server, routes, auth + approval logic
-    db.js          SQLite schema (users, sessions, login_attempts, links)
-    admin-cli.js   recovery commands
-    public/index.html   the whole front end
+## Deployment
+
+`Dockerfile` builds on `node:22.23.4-alpine` (current Node 22 LTS). Runtime
+environment:
+
+| Variable | Purpose |
+| --- | --- |
+| `PORT` | Listen port (default `3000`) |
+| `HOST` | Bind address (default `0.0.0.0` when `PORT` is set) |
+| `DB_PATH` | SQLite file, e.g. `/data/nexus.db` on a mounted disk |
+| `ADMIN_EMAIL` | Administrator email to provision at boot |
+| `ADMIN_PASSWORD` | Initial administrator password |
+
+Mount a persistent volume at `/data` so the database survives redeploys. If
+`DB_PATH` is unwritable the server falls back to a temporary directory and logs
+the path it actually opened.
