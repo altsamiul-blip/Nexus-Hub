@@ -184,6 +184,7 @@ async function main() {
     ]);
   });
 
+  let registerData;
   await step('1. a new member can register', async () => {
     const res = await member.post('/api/auth/register', {
       name: 'Casey Member',
@@ -192,12 +193,17 @@ async function main() {
     });
     assert.equal(res.status, 201, JSON.stringify(res.data));
     assert.equal(res.data.user.email, MEMBER_EMAIL);
+    registerData = res.data;
     memberId = res.data.user.id;
   });
 
   await step('2. registration sets status = pending and sends no confirmation', async () => {
-    const body = JSON.stringify(member);
-    assert.ok(body.includes(MEMBER_EMAIL));
+    // The registration response must never hand back a verification token,
+    // OTP or magic link — approval is the only gate.
+    const body = JSON.stringify(registerData);
+    assert.equal(registerData.user.status, 'pending');
+    assert.match(registerData.message, /approval/i);
+    assert.doesNotMatch(body, /verif|confirm|otp|token|magic/i);
     const me = await member.get('/api/auth/me');
     assert.equal(me.status, 200);
     assert.equal(me.data.user.status, 'pending');
