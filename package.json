@@ -10,7 +10,6 @@
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning server.js",
     "dev": "node --disable-warning=ExperimentalWarning server.js",
-    "admin": "node --disable-warning=ExperimentalWarning admin-cli.js",
     "test": "node --disable-warning=ExperimentalWarning test/workflow.test.js"
   },
   "dependencies": {}
